@@ -2,7 +2,10 @@
 // otherwise the local Node server in server.js.
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 
-const COLS = ['projects', 'rooms', 'materials', 'log', 'orders'];
+const COLS = ['projects', 'rooms', 'materials', 'log', 'orders', 'files', 'messages', 'notifications'];
+// Chats and notifications are personal (each person sees their own), so a backup restore leaves them alone.
+const RESTORE_COLS = ['projects', 'rooms', 'materials', 'log', 'orders', 'files'];
+const BUCKET = 'room-files';
 
 export async function createBackend({ onStatus = () => {} } = {}) {
   return SUPABASE_URL && SUPABASE_ANON_KEY ? supabaseBackend(onStatus) : serverBackend(onStatus);
@@ -26,12 +29,19 @@ async function supabaseBackend(onStatus) {
 
   async function fetchAll(table) {
     const out = [];
-    for (let from = 0; ; from += 1000) {
-      const rows = check(await sb.from(table).select('data').order('id').range(from, from + 999));
-      out.push(...rows.map(r => r.data));
-      if (rows.length < 1000) return out;
+    try {
+      for (let from = 0; ; from += 1000) {
+        const rows = check(await sb.from(table).select('data').order('id').range(from, from + 999));
+        out.push(...rows.map(r => r.data));
+        if (rows.length < 1000) return out;
+      }
+    } catch (e) {
+      // Newer tables may not exist until the latest schema.sql has been run; the app keeps working without them.
+      if (['files', 'messages', 'notifications'].includes(table)) { console.warn(`${table}: ${e.message}`); return []; }
+      throw e;
     }
   }
+  const stamp = item => ({ id: item.id, data: item, updated_at: new Date().toISOString() });
 
   return {
     mode: 'supabase',
@@ -40,6 +50,29 @@ async function supabaseBackend(onStatus) {
     async signIn(email, password) { const { data, error } = await sb.auth.signInWithPassword({ email, password }); if (error) throw error; return data.user; },
     async signOut() { await sb.auth.signOut(); },
     async changePassword(password) { const { error } = await sb.auth.updateUser({ password }); if (error) throw error; },
+    async chatMembers() {
+      const { data, error } = await sb.from('chat_members').select('email');
+      return error ? [] : data.map(r => r.email.toLowerCase());
+    },
+    // New records only (chat messages, notifications): plain insert works with the stricter security rules.
+    insert: (col, item) => run(async () => check(await sb.from(col).insert(stamp(item)))),
+    update: (col, item) => run(async () => check(await sb.from(col).update({ data: item, updated_at: new Date().toISOString() }).eq('id', item.id))),
+    uploadFile: (path, file) => run(async () => {
+      const { error } = await sb.storage.from(BUCKET).upload(path, file, { contentType: file.type || 'application/octet-stream', upsert: false });
+      if (error) throw new Error(error.message);
+    }),
+    async fileUrl(path, downloadName) {
+      const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(path, 3600,downloadName ? { download: downloadName } : undefined);
+      if (error) throw new Error(error.message);
+      return data.signedUrl;
+    },
+    deleteFile: path => run(async () => { const { error } = await sb.storage.from(BUCKET).remove([path]); if (error) throw new Error(error.message); }),
+    // Phone notifications: remember which devices this person turned them on for.
+    async savePush(id, email, subscription) {
+      check(await sb.from('push_subscriptions').upsert({ id, email, data: subscription, updated_at: new Date().toISOString() }));
+    },
+    async deletePush(id) { check(await sb.from('push_subscriptions').delete().eq('id', id)); },
+    pushAvailable: true,
     load: () => run(async () => {
       const [settings, ...lists] = await Promise.all([
         sb.from('settings').select('data').eq('id', 1).maybeSingle().then(check),
@@ -50,14 +83,14 @@ async function supabaseBackend(onStatus) {
       db.log.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
       return db;
     }),
-    put: (col, item) => run(async () => check(await sb.from(col).upsert({ id: item.id, data: item, updated_at: new Date().toISOString() }))),
+    put: (col, item) => run(async () => check(await sb.from(col).upsert(stamp(item)))),
     del: (col, id) => run(async () => {
       if (col === 'projects') check(await sb.from('rooms').delete().eq('data->>projectId', id));
       check(await sb.from(col).delete().eq('id', id));
     }),
     putSettings: settings => run(async () => check(await sb.from('settings').upsert({ id: 1, data: settings, updated_at: new Date().toISOString() }))),
     importAll: db => run(async () => {
-      for (const c of COLS) {
+      for (const c of RESTORE_COLS) {
         check(await sb.from(c).delete().neq('id', ''));
         const rows = db[c] || [];
         for (let i = 0; i < rows.length; i += 500) {
@@ -100,6 +133,19 @@ function serverBackend(onStatus) {
     del: (col, id) => run(() => api('DELETE', `api/${col}/${encodeURIComponent(id)}`)),
     putSettings: settings => run(() => api('PUT', 'api/settings', settings)),
     importAll: db => run(() => api('POST', 'api/import', db)),
+    chatMembers: () => api('GET', 'api/chat-members').then(list => list.map(e => e.toLowerCase())).catch(() => []),
+    insert: (col, item) => run(() => api('PUT', `api/${col}/${encodeURIComponent(item.id)}`, item)),
+    update: (col, item) => run(() => api('PUT', `api/${col}/${encodeURIComponent(item.id)}`, item)),
+    uploadFile: (path, file) => run(async () => {
+      const res = await fetch(`api/upload/${path.split('/').map(encodeURIComponent).join('/')}`, { method: 'PUT', body: file });
+      if (!res.ok) throw new Error('Upload failed');
+    }),
+    async fileUrl(path) { return `api/download/${path.split('/').map(encodeURIComponent).join('/')}`; },
+    deleteFile: path => run(() => api('DELETE', `api/upload/${path.split('/').map(encodeURIComponent).join('/')}`)),
+    // Phone notifications need the hosted (Supabase) setup; locally they are a no-op.
+    async savePush() {},
+    async deletePush() {},
+    pushAvailable: false,
     watch(onChange) {
       const poll = async () => {
         if (document.hidden) return;

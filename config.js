@@ -4,3 +4,5 @@
 // Leave both empty to run against the local Node server (npm start).
 export const SUPABASE_URL = 'https://rdkdlxbvtfqxuvufdvvh.supabase.co';
 export const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJka2RseGJ2dGZxeHV2dWZkdnZoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIyNTk5MDcsImV4cCI6MjEwNzgzNTkwN30.eZqcqfYBPmK3nsDl9zPt_ydpzmIWcHHrpnPJx28j88s';
+// Public key for phone (push) notifications. Its private half lives only in Supabase Edge Function secrets.
+export const VAPID_PUBLIC_KEY = 'BC2OGNYnQezeTob9T9VWMwueDmgA2CTsefTce9B29vqQeAaJfIopwjgaKEU7Vq0PtNWDoWiST1EQFULq_xEIrUE';

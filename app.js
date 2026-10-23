@@ -1,11 +1,12 @@
 // Hakan Production Tracker — single-page app (no build step).
 import { createBackend } from './backend.js';
+import { VAPID_PUBLIC_KEY } from './config.js';
 
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const view = $('#view');
 
-const S = { db: null, me: lsGet('hakan.me'), user: null, disposeHero: null, filters: {} };
+const S = { db: null, me: lsGet('hakan.me'), user: null, disposeHero: null, filters: {}, chatMembers: [], openRoom: null, seenNotifs: new Set() };
 let B; // backend (Supabase or local server)
 
 const DEFAULT_SETTINGS = {
@@ -78,8 +79,8 @@ const typeColor = m => {
 /* ---------------- job materials vs stock ---------------- */
 const norm = s => String(s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
 
-// A project's raw material lines: [{ name, colorCode, qty }].
-// Older projects kept one text box ("Vicenza Oak H3157(), Classic White ()"); split that into lines.
+// Raw material lines: [{ name, colorCode, qty }]. Each room has its own list (room.materials).
+// Projects may still carry an older job-level list, or one text box ("Vicenza Oak H3157(), Classic White ()").
 function estimateRows(p) {
   if (Array.isArray(p.materials)) return p.materials;
   return String(p.materialEstimate || '').split(/[,;\n]+/).map(part => {
@@ -93,37 +94,45 @@ const findStock = line =>
   (line.colorCode && S.db.materials.find(m => m.colorCode && norm(m.colorCode) === norm(line.colorCode)))
   || S.db.materials.find(m => norm(m.name) === norm(line.name)) || null;
 
-// A job needs its material until every room has reached Production (by then the sheets are cut).
+// Material is needed until it's cut: a room's list counts until that room reaches Production;
+// an older job-level list counts until every room has.
 const STAGE_PRODUCTION = 5;
 const needsMaterial = p => { const rs = roomsOf(p.id); return !rs.length || rs.some(r => r.stage < STAGE_PRODUCTION); };
+const roomRows = r => Array.isArray(r.materials) ? r.materials.filter(l => l.name || l.colorCode) : [];
+const lineKey = (stock, l) => stock ? stock.id : `${norm(l.colorCode)}|${norm(l.colorCode) ? '' : norm(l.name)}`;
 
-// Allocates stock to jobs, soonest target date first, and lists what must be ordered.
+// Allocates stock to jobs (soonest target date first, rooms in order) and lists what must be ordered.
 function materialPlan() {
   const left = new Map(S.db.materials.map(m => [m.id, Math.max(0, +m.qty || 0)]));
   const reserved = new Map();
-  const byProject = new Map(), orders = new Map();
+  const byProject = new Map(), byRoom = new Map(), orders = new Map();
   const jobs = [...S.db.projects].sort((a, b) => !a.targetDate - !b.targetDate || (a.targetDate || '').localeCompare(b.targetDate || '') || sortById(a, b));
   for (const p of jobs) {
-    const active = needsMaterial(p);
-    const lines = estimateRows(p).filter(l => l.name || l.colorCode).map(l => {
-      const stock = findStock(l), need = Math.max(0, +l.qty || 0);
-      if (!active) return { ...l, stock, need, covered: need, short: 0, status: 'used' };
+    const sources = [
+      ...roomsOf(p.id).sort(sortById).flatMap(r => roomRows(r).map(l => ({ l, room: r, active: r.stage < STAGE_PRODUCTION }))),
+      ...estimateRows(p).filter(l => l.name || l.colorCode).map(l => ({ l, room: null, active: needsMaterial(p) })),
+    ];
+    const lines = sources.map(({ l, room, active }) => {
+      const stock = findStock(l), need = Math.max(0, +l.qty || 0), key = lineKey(stock, l);
+      const base = { ...l, room, stock, need, key };
+      if (!active) return { ...base, covered: need, short: 0, status: 'used' };
       const have = stock ? left.get(stock.id) : 0, covered = Math.min(have, need);
       if (stock) { left.set(stock.id, have - covered); reserved.set(stock.id, (reserved.get(stock.id) || 0) + covered); }
       const short = need - covered, noAmount = !need && !(stock && +stock.qty > 0);
       const status = short > 0 || noAmount ? (stock ? 'short' : 'missing') : 'ok';
       if (status !== 'ok') {
-        const key = stock ? stock.id : `${norm(l.colorCode)}|${norm(l.colorCode) ? '' : norm(l.name)}`;
         const o = orders.get(key) || { key, name: stock?.name || l.name, colorCode: stock?.colorCode || l.colorCode, stock, short: 0, unknown: false, jobs: [] };
         o.short += short; o.unknown ||= noAmount;
-        o.jobs.push({ project: p, short, noAmount });
+        const j = o.jobs.find(x => x.project.id === p.id);
+        if (j) { j.short += short; j.noAmount ||= noAmount; } else o.jobs.push({ project: p, short, noAmount });
         orders.set(key, o);
       }
-      return { ...l, stock, need, covered, short, status };
+      return { ...base, covered, short, status };
     });
     byProject.set(p.id, lines);
+    for (const line of lines) if (line.room) byRoom.set(line.room.id, [...(byRoom.get(line.room.id) || []), line]);
   }
-  return { byProject, orders: [...orders.values()], reserved };
+  return { byProject, byRoom, orders: [...orders.values()], reserved };
 }
 
 /* ---------------- saving & sync ---------------- */
@@ -150,7 +159,7 @@ async function saveSettings(patch) {
 // Sorts collections so a freshly loaded copy can be compared with the one on screen.
 function normalize(db) {
   const out = { ...db, settings: { ...DEFAULT_SETTINGS, ...(db.settings || {}) } };
-  for (const c of ['projects', 'rooms', 'materials', 'orders']) out[c] = [...(db[c] || [])].sort((a, b) => a.id.localeCompare(b.id));
+  for (const c of ['projects', 'rooms', 'materials', 'orders', 'files', 'messages', 'notifications']) out[c] = [...(db[c] || [])].sort((a, b) => a.id.localeCompare(b.id));
   out.log = [...(db.log || [])].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
   return out;
 }
@@ -164,7 +173,20 @@ async function refresh() {
     lsSet('hakan.cache', JSON.stringify(S.db));
     const typing = view.contains(document.activeElement) && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
     if (!typing) render(true);
+    refreshOpenRoom();
+    announceNew();
   } catch {}
+}
+
+// Pops up notifications that arrived while the app is open, and updates the bell.
+function announceNew() {
+  const fresh = myNotifications().filter(n => !n.read && !S.seenNotifs.has(n.id));
+  fresh.forEach(n => S.seenNotifs.add(n.id));
+  paintBell();
+  const n = fresh[0]; if (!n) return;
+  if (n.type === 'mention' && S.openRoom?.id === n.roomId && S.openRoom.tab === 'chat') { markRoomRead(n.roomId); return; }
+  navigator.vibrate?.([30, 60, 30]);
+  toast(`🔔 ${notifTitle(n)}`, { label: 'Open', fn: () => openNotification(n.id) });
 }
 
 /* ---------------- toast, sheet, celebrate ---------------- */
@@ -188,7 +210,7 @@ function openSheet(html, onMount) {
   scrim.onclick = () => closeSheet();
   // Drag the grab handle down to dismiss.
   let y0 = null, dy = 0;
-  sheet.addEventListener('touchstart', e => { if (sheet.scrollTop <= 0) { y0 = e.touches[0].clientY; dy = 0; } }, { passive: true });
+  sheet.addEventListener('touchstart', e => { if (sheet.scrollTop <= 0 && !e.target.closest('.chat-list, textarea, .est, .tabs')) { y0 = e.touches[0].clientY; dy = 0; } }, { passive: true });
   sheet.addEventListener('touchmove', e => { if (y0 === null) return; dy = e.touches[0].clientY - y0; if (dy > 0 && innerWidth < 760) { sheet.style.transition = 'none'; sheet.style.transform = `translateY(${dy}px)`; } }, { passive: true });
   sheet.addEventListener('touchend', () => { if (y0 === null) return; sheet.style.transition = ''; sheet.style.transform = ''; if (dy > 110) closeSheet(); y0 = null; });
   sheetStack++;
@@ -198,6 +220,7 @@ function openSheet(html, onMount) {
 }
 function closeSheet(instant) {
   const root = $('#sheet-root');
+  S.openRoom = null;
   if (!root.firstChild) return;
   document.body.style.overflow = '';
   if (instant) { root.innerHTML = ''; return; }
@@ -247,6 +270,16 @@ function roomCard(r, { showProject = true } = {}) {
       ${inst !== null ? `<span class="badge ${inst >= 0 && inst <= 14 ? 'warn' : ''}">Install ${fmtDate(r.installDate)}</span>` : ''}
     </div>
     ${r.nextAction && r.stage < 7 ? `<div class="sub">Next: <b style="color:var(--ink);font-weight:600">${esc(r.nextAction)}</b></div>` : ''}
+    ${(() => {
+      const m = roomRows(r).length, f = roomFiles(r.id).length, c = canChat() ? roomMessages(r.id).length : 0;
+      const unread = canChat() ? myNotifications().some(n => !n.read && n.type === 'mention' && n.roomId === r.id) : false;
+      const chip = (tab, ic, label) => `<button class="room-chip" data-action="room-tab" data-id="${esc(r.id)}" data-tab="${tab}">${icon(ic)}${label}</button>`;
+      return `<div class="room-chips">
+        ${chip('materials', I.layers, m ? `${m} material${m > 1 ? 's' : ''}` : 'Materials')}
+        ${chip('files', '<path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4"/>', f ? `${f} file${f > 1 ? 's' : ''}` : 'Files')}
+        ${canChat() ? chip('chat', '<path d="M4 5h16v11H9l-5 4z"/>', `${c || 'Chat'}${unread ? ' <span class="dot" style="background:var(--bad);width:7px;height:7px"></span>' : ''}`) : ''}
+      </div>`;
+    })()}
     ${r.stage < 7 ? `<div class="room-actions"><button class="btn sm next-btn" data-action="advance" data-id="${esc(r.id)}">${r.stage === 6 ? 'Mark completed' : `Move to ${esc(shortStage(r.stage + 1))}`} ${icon(I.arrow)}</button></div>` : ''}
   </article>`;
 }
@@ -480,24 +513,49 @@ function driveUrl(v) {
 
 const fmtQty = n => Number.isInteger(+n) ? String(+n) : (+n).toFixed(1);
 
-function jobMaterials(p) {
-  const lines = materialPlan().byProject.get(p.id) || [];
-  const status = l => ({
+// Status badge for one material line (or a group of lines) against stock.
+function matStatus(l) {
+  return ({
     ok: '<span class="badge ok">In stock</span>',
     used: '<span class="badge">In production</span>',
     short: l.need ? `<span class="badge bad">Order ${fmtQty(l.short)}</span>` : '<span class="badge warn">Set amount</span>',
     missing: `<span class="badge bad">${l.need ? `Order ${fmtQty(l.short)}` : 'Not in stock'}</span>`,
   })[l.status];
-  const shortCount = lines.filter(l => l.status === 'short' || l.status === 'missing').length;
+}
+
+// Project page: each material totalled across the job's rooms, tap to see the room-by-room breakdown.
+function jobMaterials(p) {
+  const lines = materialPlan().byProject.get(p.id) || [];
+  const groups = new Map();
+  for (const l of lines) {
+    const g = groups.get(l.key) || { name: l.stock?.name || l.name, colorCode: l.stock?.colorCode || l.colorCode, stock: l.stock, need: 0, short: 0, lines: [] };
+    g.need += l.need; g.short += l.short; g.lines.push(l);
+    groups.set(l.key, g);
+  }
+  for (const g of groups.values()) {
+    const open = g.lines.filter(l => l.status !== 'used');
+    g.status = !open.length ? 'used' : open.some(l => l.status === 'missing') ? 'missing' : open.some(l => l.status === 'short') ? 'short' : 'ok';
+    if (g.status === 'short' && !g.short) g.need = 0; // shows "Set amount"
+  }
+  const total = lines.reduce((s, l) => s + l.need, 0), roomCount = new Set(lines.filter(l => l.room).map(l => l.room.id)).size;
+  const shortCount = [...groups.values()].filter(g => g.status === 'short' || g.status === 'missing').length;
   return `<section class="section">
     <div class="section-head"><h2>Raw materials</h2>${shortCount ? `<a class="badge bad" href="#/stock?f=order">${shortCount} to order</a>` : lines.length ? '<span class="badge ok">All covered</span>' : ''}</div>
-    ${lines.length ? `<div class="card mtable" style="padding:2px 14px">${lines.map(l => `
-      <div class="mline">
-        <div style="min-width:0"><div class="nm ellipsis">${esc(l.name || l.colorCode)}</div>
-          <div class="cd">${[l.colorCode && l.name ? esc(l.colorCode) : '', l.need ? `${fmtQty(l.need)} needed` : 'no amount', l.status !== 'used' ? (l.stock ? `${fmtQty(l.stock.qty)} in stock` : 'not in stock') : ''].filter(Boolean).join(' · ')}</div></div>
-        ${status(l)}
-      </div>`).join('')}</div>`
-      : empty('No materials listed', 'Add the sheet goods this job needs so the stock list knows what to order.', { action: 'edit-project', label: 'Add materials', data: `data-id="${esc(p.id)}"` })}
+    ${lines.length ? `<div class="small muted" style="margin:-4px 0 10px">Job total: <b style="color:var(--ink)">${fmtQty(total)} sheets</b> from ${roomCount} room${roomCount === 1 ? '' : 's'} · tap a material to see each room</div>
+    <div class="card mtable" style="padding:2px 14px">${[...groups.values()].map(g => `
+      <details class="mgroup">
+        <summary class="mline">
+          <div style="min-width:0"><div class="nm ellipsis">${esc(g.name || g.colorCode)}</div>
+            <div class="cd">${(() => { const cut = g.lines.filter(l => l.status === 'used').reduce((s, l) => s + l.need, 0); return [g.colorCode && g.name ? esc(g.colorCode) : '', g.need ? `<b>${fmtQty(g.need)}</b> total` : 'no amount', cut && g.status !== 'used' ? `${fmtQty(cut)} already cut` : '', g.status !== 'used' ? (g.stock ? `${fmtQty(g.stock.qty)} in stock` : 'not in stock') : ''].filter(Boolean).join(' · '); })()}</div></div>
+          ${matStatus(g)}
+        </summary>
+        <div class="mrooms">${g.lines.map(l => `
+          <button class="mroom" ${l.room ? `data-action="room-tab" data-id="${esc(l.room.id)}" data-tab="materials"` : `data-action="edit-project" data-id="${esc(p.id)}"`}>
+            <span class="grow ellipsis">${l.room ? esc(l.room.name) : '<i>Job-level (not in a room)</i>'}</span>
+            <b>${l.need ? fmtQty(l.need) : '—'}</b>${matStatus(l)}
+          </button>`).join('')}</div>
+      </details>`).join('')}</div>`
+      : empty('No materials listed yet', 'Open a room and add its raw material estimate in the Materials tab. The job total adds up here automatically.')}
   </section>`;
 }
 
@@ -656,6 +714,115 @@ function matCard(m, plan = materialPlan()) {
   </article>`;
 }
 
+/* ---------------- notifications ---------------- */
+function notifTitle(n) {
+  if (n.type === 'test') return 'Test notification';
+  return n.type === 'mention'
+    ? `${n.by || 'Someone'} tagged you · ${n.room}${n.client ? `, ${n.client}` : ''}`
+    : `${n.room}${n.client ? ` · ${n.client}` : ''} is ready for ${stage(n.to).name}`;
+}
+function paintBell() {
+  const n = S.db ? unreadCount() : 0, b = $('#bell-n');
+  if (b) { b.textContent = n > 99 ? '99+' : n; b.hidden = !n; }
+  try { n ? navigator.setAppBadge?.(n) : navigator.clearAppBadge?.(); } catch {}
+}
+async function openNotification(id) {
+  const n = myNotifications().find(x => x.id === id); if (!n) return;
+  if (!n.read) { n.read = true; paintBell(); B.update('notifications', n).catch(() => {}); render(true); }
+  if (n.type === 'test') return;
+  if (!S.db.rooms.some(r => r.id === n.roomId)) return toast('That room no longer exists');
+  if (!location.hash.startsWith('#/project/')) location.hash = `#/project/${encodeURIComponent(n.projectId)}`;
+  setTimeout(() => sheetRoom(n.roomId, n.type === 'mention' ? 'chat' : 'overview'), 60);
+}
+
+/* ---------------- phone (push) notifications ---------------- */
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isAppleMobile = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const b64ToBytes = s => Uint8Array.from(atob((s + '='.repeat((4 - s.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+async function deviceId(sub) {
+  const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sub.endpoint));
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 40);
+}
+async function swReg() {
+  await navigator.serviceWorker.register('sw.js');
+  return navigator.serviceWorker.ready;
+}
+// 'on' | 'off' | 'denied' | 'install' (iPhone: add to Home Screen first) | 'unsupported' | 'local'
+async function pushState() {
+  if (!B.pushAvailable || !VAPID_PUBLIC_KEY) return 'local';
+  if (!pushSupported()) return isAppleMobile() && !isStandalone() ? 'install' : 'unsupported';
+  if (Notification.permission === 'denied') return 'denied';
+  if (Notification.permission !== 'granted') return 'off';
+  const reg = await navigator.serviceWorker.getRegistration();
+  return (await reg?.pushManager.getSubscription()) ? 'on' : 'off';
+}
+async function enablePush() {
+  try {
+    if (await Notification.requestPermission() !== 'granted') { toast('Notifications were not allowed'); paintPushCard(); return false; }
+    const reg = await swReg();
+    const sub = await reg.pushManager.getSubscription() || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(VAPID_PUBLIC_KEY) });
+    await B.savePush(await deviceId(sub), myEmail(), sub.toJSON());
+    toast('Phone notifications are on ✓'); paintPushCard(); return true;
+  } catch (e) {
+    toast('Could not turn on notifications'); console.warn(e); paintPushCard(); return false;
+  }
+}
+async function disablePush() {
+  const sub = await (await navigator.serviceWorker.getRegistration())?.pushManager.getSubscription();
+  if (sub) { await B.deletePush(await deviceId(sub)).catch(() => {}); await sub.unsubscribe(); }
+  toast('Phone notifications turned off for this device'); paintPushCard();
+}
+// Keeps this device linked to whoever is signed in (in case the phone is shared or the login changed).
+async function syncPush() {
+  if (await pushState() !== 'on') return;
+  const sub = await (await navigator.serviceWorker.getRegistration()).pushManager.getSubscription();
+  B.savePush(await deviceId(sub), myEmail(), sub.toJSON()).catch(() => {});
+}
+async function sendTestPush() {
+  await B.insert('notifications', { id: uid(), toEmail: myEmail(), toName: S.me || '', by: S.me || '', ts: new Date().toISOString(), read: false, type: 'test', text: 'Phone notifications are working on this device ✓' });
+  toast('Test sent. Lock your phone or switch apps; it should arrive in a few seconds.');
+}
+async function paintPushCard() {
+  const el = $('#push-card'); if (!el) return;
+  const state = await pushState();
+  const body = {
+    on: `<div class="title">✓ Phone notifications are on</div><div class="sub">You'll get a notification on this device even when the app is closed or the screen is locked.</div>
+         <div class="row" style="margin-top:12px;gap:8px"><button class="btn sm" data-action="push-test">Send a test</button><button class="btn sm ghost" data-action="push-off">Turn off</button></div>`,
+    off: `<div class="title">Get notifications on this phone</div><div class="sub">See tags and stage changes even when the app is closed or the screen is locked.</div>
+          <button class="btn block" data-action="push-on" style="margin-top:12px">${icon('<path d="M6 16V11a6 6 0 1 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/>')}Turn on phone notifications</button>`,
+    denied: `<div class="title">Notifications are blocked</div><div class="sub">Turn them back on in your phone's settings: <b>Settings → Notifications → Hakan</b> (iPhone), or long-press the Hakan app icon → <b>App info → Notifications</b> (Android). Then come back here.</div>`,
+    install: `<div class="title">First, add Hakan to your Home Screen</div><div class="sub">On iPhone, notifications only work in the Home Screen app. In Safari, tap <b>Share → Add to Home Screen</b>, open Hakan from your Home Screen, sign in, and come back to this page.</div>`,
+    unsupported: `<div class="title">This browser can't show notifications</div><div class="sub">Use Chrome on Android, or Safari on iPhone (from the Home Screen app).</div>`,
+    local: '',
+  }[state];
+  el.hidden = !body;
+  el.className = `card push-card ${state}`;
+  el.innerHTML = body;
+}
+
+function viewNotifications() {
+  const list = myNotifications(), unread = list.filter(n => !n.read).length;
+  const groups = {};
+  list.forEach(n => { const d = new Date(n.ts).toDateString(); (groups[d] = groups[d] || []).push(n); });
+  return `<div class="page-title"><h1>Notifications</h1>${unread ? '<button class="btn sm ghost" data-action="read-all">Mark all read</button>' : ''}</div>
+  <div id="push-card" class="card push-card" hidden></div>
+  <div class="chips" style="margin-bottom:6px"><span class="small muted" style="padding:6px 0">You get a notification when someone tags you in a room chat, or when a room reaches a stage you own.</span></div>
+  ${Object.entries(groups).map(([d, ns]) => `<section class="section" style="margin-top:14px">
+    <div class="eyebrow" style="margin-bottom:8px">${new Date(d).toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}</div>
+    <div class="card notif-list">${ns.map(n => `
+      <button class="notif ${n.read ? '' : 'unread'}" data-action="open-notif" data-id="${esc(n.id)}">
+        <span class="notif-ico ${n.type}">${n.type === 'mention' ? '@' : n.type === 'test' ? '✓' : icon(I.arrow)}</span>
+        <span class="grow" style="min-width:0">
+          <span class="title" style="display:block">${esc(notifTitle(n))}</span>
+          ${n.type === 'mention' ? `<span class="sub notif-text">“${esc(n.text)}”</span>` : n.type === 'test' ? `<span class="sub">${esc(n.text)}</span>` : `<span class="sub">${esc(n.by || 'Someone')} moved it from ${esc(shortStage(n.from))} → ${esc(stage(n.to).name)}</span>`}
+          <span class="when">${timeAgo(n.ts)}</span>
+        </span>
+        ${n.read ? '' : '<span class="dot" style="background:var(--bad)"></span>'}
+      </button>`).join('')}</div>
+  </section>`).join('') || empty('No notifications yet', 'When someone tags you in a room chat, or a room reaches your stage, it shows up here.')}`;
+}
+
 function viewActivity() {
   const log = [...S.db.log].reverse();
   const groups = {};
@@ -677,6 +844,13 @@ function viewSettings() {
   </section>
   <section class="section"><div class="section-head"><h2>Stage owners</h2></div>
     <div class="card form">${stages().filter(st => st.n < 7).map(st => `<label class="field"><span>${esc(stageLabel(st.n))}</span><select data-action="stage-owner" data-n="${st.n}"><option value="">—</option>${s.people.map(p => `<option ${p.name === st.owner ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>`).join('')}</div>
+  </section>
+  <section class="section"><div class="section-head"><h2>Room chat</h2></div>
+    <div class="card flat" style="background:var(--taupe-50)">
+      <div class="title">Only these people can see room chats</div>
+      <div class="pick" style="margin:10px 0">${S.chatMembers.map(e => `<span class="badge dark">${esc(set().people.find(p => p.email?.toLowerCase() === e)?.name || e)}</span>`).join('') || '<span class="muted small">Not set up yet</span>'}</div>
+      <div class="sub">For privacy, this list can't be changed from the app. To add or remove someone, ask Claude for the one-line database update.</div>
+    </div>
   </section>
   ${listEditor('roomTypes', 'Room types')}
   ${listEditor('materialTypes', 'Material types')}
@@ -705,35 +879,267 @@ function select(label, name, value, options, allowBlank = true) {
 }
 const formData = form => Object.fromEntries(new FormData(form).entries());
 
-function sheetRoom(id) {
+/* ---------------- room: chat, files, notifications helpers ---------------- */
+const myEmail = () => (S.user?.email || personEmail(S.me) || '').toLowerCase();
+const canChat = () => !!myEmail() && S.chatMembers.includes(myEmail());
+const chatPeople = () => set().people.filter(p => p.email && S.chatMembers.includes(p.email.toLowerCase()));
+const roomMessages = id => (S.db.messages || []).filter(m => m.roomId === id).sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+const roomFiles = id => (S.db.files || []).filter(f => f.roomId === id).sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+const myNotifications = () => (S.db.notifications || []).filter(n => (n.toEmail || '').toLowerCase() === myEmail()).sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+const unreadCount = () => myNotifications().filter(n => !n.read).length;
+const fmtSize = b => b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`;
+const FILE_TYPES = ['pdf', 'xxl'];
+const MAX_FILE = 50 * 1048576;
+
+// Sends a notification to a teammate by name (skips yourself and people without an email).
+async function notify(toName, data) {
+  const email = personEmail(toName).toLowerCase();
+  if (!email || email === myEmail()) return;
+  const n = { id: uid(), toEmail: email, toName, by: S.me || '', ts: new Date().toISOString(), read: false, ...data };
+  try { await B.insert('notifications', n); } catch { /* a missed notification must not block the user's action */ }
+}
+
+// Chat text with @Name tags highlighted.
+function chatText(text) {
+  const names = chatPeople().map(p => p.name).sort((a, b) => b.length - a.length).map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  let html = esc(text).replace(/\n/g, '<br>');
+  if (names.length) html = html.replace(new RegExp(`@(${names.join('|')})\\b`, 'gi'), '<b class="tag">@$1</b>');
+  return html;
+}
+function chatList(roomId) {
+  const msgs = roomMessages(roomId);
+  if (!msgs.length) return '<div class="chat-empty">No messages yet. Start the conversation, and tag someone with @ to ping them.</div>';
+  let lastDay = '';
+  return msgs.map(m => {
+    const day = new Date(m.ts).toDateString(), mine = (m.byEmail || '').toLowerCase() === myEmail();
+    const sep = day !== lastDay ? `<div class="chat-day">${new Date(m.ts).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</div>` : '';
+    lastDay = day;
+    return `${sep}<div class="msg ${mine ? 'mine' : ''}">
+      ${mine ? '' : `<span class="mini-av">${initials(m.by)}</span>`}
+      <div class="bubble"><div class="msg-meta">${mine ? 'You' : esc(m.by)} · ${new Date(m.ts).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}${mine ? ` · <button data-action="delete-msg" data-id="${esc(m.id)}">delete</button>` : ''}</div>${chatText(m.text)}</div>
+    </div>`;
+  }).join('');
+}
+function fileList(roomId) {
+  const files = roomFiles(roomId);
+  return files.map(f => `<div class="file-row">
+      <a class="file-open" data-file="${esc(f.id)}" href="#" target="_blank" rel="noopener">
+        <span class="file-ico ${esc(f.type)}">${esc((f.type || '').toUpperCase())}</span>
+        <span class="grow" style="min-width:0"><span class="title ellipsis" style="display:block">${esc(f.name)}</span><span class="sub">${fmtSize(f.size || 0)} · ${esc(f.by || '')} · ${fmtDate((f.ts || '').slice(0, 10))}</span></span>
+      </a>
+      <button class="icon-btn" data-action="delete-file" data-id="${esc(f.id)}" aria-label="Delete ${esc(f.name)}">${icon(I.trash)}</button>
+    </div>`).join('') || '<div class="chat-empty">No files yet. Add the room’s drawings (PDF) and CNC programs (XXL).</div>';
+}
+function roomMaterialStatus(roomId) {
+  const lines = materialPlan().byRoom.get(roomId) || [];
+  return lines.length ? `<div class="card mtable" style="padding:2px 14px;margin-top:14px">${lines.map(l => `<div class="mline">
+      <div style="min-width:0"><div class="nm ellipsis">${esc(l.name || l.colorCode)}</div><div class="cd">${[l.colorCode && l.name ? esc(l.colorCode) : '', l.need ? `${fmtQty(l.need)} needed` : 'no amount', l.status !== 'used' ? (l.stock ? `${fmtQty(l.stock.qty)} in stock` : 'not in stock') : ''].filter(Boolean).join(' · ')}</div></div>
+      ${matStatus(l)}</div>`).join('')}</div>` : '';
+}
+
+// Updates the parts of an open room screen that teammates can change while you look at it.
+function refreshOpenRoom() {
+  const o = S.openRoom; if (!o) return;
+  const list = $('#chat-list');
+  if (list) {
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+    list.innerHTML = chatList(o.id);
+    if (atBottom) list.scrollTop = list.scrollHeight;
+  }
+  const files = $('#file-list'); if (files) { files.innerHTML = fileList(o.id); signFileLinks(files); }
+  const n = (sel, v) => { const el = $(sel); if (el) el.textContent = v || ''; };
+  n('#tab-n-chat', roomMessages(o.id).length); n('#tab-n-files', roomFiles(o.id).length); n('#tab-n-materials', roomRows(S.db.rooms.find(r => r.id === o.id) || {}).length);
+}
+
+function sheetRoom(id, tab = 'overview') {
   const r = S.db.rooms.find(x => x.id === id); if (!r) return;
+  if (tab === 'chat' && !canChat()) tab = 'overview';
   const p = project(r.projectId), d = daysIn(r);
   const hist = S.db.log.filter(l => l.roomId === id).slice().reverse();
+  const tabs = [['overview', 'Overview'], ['materials', 'Materials'], ['files', 'Files'], ...(canChat() ? [['chat', 'Chat']] : [])];
+  const count = { materials: roomRows(r).length, files: roomFiles(id).length, chat: roomMessages(id).length };
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   openSheet(`
     <div class="sheet-head"><div style="min-width:0"><div class="eyebrow">${esc(p?.client || r.projectId)} · ${esc(r.id)}</div><h2>${esc(r.name)}</h2>
       <div class="sub">${esc(stageLabel(r.stage))}${stage(r.stage).owner ? ` · ${esc(stage(r.stage).owner)}` : ''}${d !== null ? ` · ${d} days in stage` : ''}</div></div>
       <a class="icon-btn" href="#/project/${encodeURIComponent(r.projectId)}" data-action="close" aria-label="Open project">${icon(I.folder)}</a>
     </div>
-    ${r.stage < 7 ? `<button class="btn block taupe" data-action="advance" data-id="${esc(r.id)}" style="height:54px;font-size:16px">${r.stage === 6 ? 'Mark completed ✓' : `Move to ${esc(stageLabel(r.stage + 1))}`} ${icon(I.arrow)}</button>` : ''}
-    <div class="eyebrow" style="margin:18px 0 6px">Stage — tap to change</div>
-    <div class="stepper">${stages().map(s => `<button data-action="set-stage" data-id="${esc(r.id)}" data-n="${s.n}" class="${s.n < r.stage ? 'done' : s.n === r.stage ? 'cur' : ''}"><span class="num">${s.n < r.stage ? '✓' : s.n}</span><span class="nm">${esc(s.name)}</span><span class="ow">${esc(s.owner)}</span></button>`).join('')}</div>
-    <form class="form" id="room-form" style="margin-top:18px">
-      <div class="eyebrow">Details</div>
-      ${select('Room', 'name', r.name, set().roomTypes, false)}
-      ${field('Next action', 'nextAction', r.nextAction, 'text', 'placeholder="e.g. Confirm hinge type with client"')}
-      <div class="field-row">${field('Due date', 'dueDate', r.dueDate, 'date')}${field('Install date', 'installDate', r.installDate, 'date')}</div>
-      ${field('G-code / files link', 'filesLink', r.filesLink, 'url', 'placeholder="https://…"')}
-      ${field('Notes', 'notes', r.notes, 'textarea')}
-      <div class="sheet-actions two"><button type="button" class="btn danger" data-action="delete-room" data-id="${esc(r.id)}">${icon(I.trash)}Delete</button><button class="btn" type="submit">Save</button></div>
-    </form>
-    ${hist.length ? `<div class="eyebrow" style="margin:22px 0 4px">History</div>${timeline(hist)}` : ''}
+    <div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button role="tab" data-tab="${k}" class="${k === tab ? 'on' : ''}">${l}${k !== 'overview' ? `<span class="n" id="tab-n-${k}">${count[k] || ''}</span>` : ''}</button>`).join('')}</div>
+
+    <div class="pane" data-pane="overview" ${tab === 'overview' ? '' : 'hidden'}>
+      ${r.stage < 7 ? `<button class="btn block taupe" data-action="advance" data-id="${esc(r.id)}" style="height:54px;font-size:16px">${r.stage === 6 ? 'Mark completed ✓' : `Move to ${esc(stageLabel(r.stage + 1))}`} ${icon(I.arrow)}</button>` : ''}
+      <div class="eyebrow" style="margin:18px 0 6px">Stage — tap to change</div>
+      <div class="stepper">${stages().map(s => `<button data-action="set-stage" data-id="${esc(r.id)}" data-n="${s.n}" class="${s.n < r.stage ? 'done' : s.n === r.stage ? 'cur' : ''}"><span class="num">${s.n < r.stage ? '✓' : s.n}</span><span class="nm">${esc(s.name)}</span><span class="ow">${esc(s.owner)}</span></button>`).join('')}</div>
+      <form class="form" id="room-form" style="margin-top:18px">
+        <div class="eyebrow">Details</div>
+        ${select('Room', 'name', r.name, set().roomTypes, false)}
+        ${field('Next action', 'nextAction', r.nextAction, 'text', 'placeholder="e.g. Confirm hinge type with client"')}
+        <div class="field-row">${field('Due date', 'dueDate', r.dueDate, 'date')}${field('Install date', 'installDate', r.installDate, 'date')}</div>
+        ${field('Notes', 'notes', r.notes, 'textarea')}
+        <div class="sheet-actions two"><button type="button" class="btn danger" data-action="delete-room" data-id="${esc(r.id)}">${icon(I.trash)}Delete</button><button class="btn" type="submit">Save</button></div>
+      </form>
+      ${hist.length ? `<div class="eyebrow" style="margin:22px 0 4px">History</div>${timeline(hist)}` : ''}
+    </div>
+
+    <div class="pane" data-pane="materials" ${tab === 'materials' ? '' : 'hidden'}>
+      <div class="sub" style="margin-bottom:10px">Raw material estimate for this room. The project page adds up all rooms into the job total.</div>
+      <form class="form" id="room-mat-form">
+        ${estTable(roomRows(r))}
+        <button class="btn block" type="submit">Save materials</button>
+      </form>
+      <div id="room-mat-status">${roomMaterialStatus(r.id)}</div>
+    </div>
+
+    <div class="pane" data-pane="files" ${tab === 'files' ? '' : 'hidden'}>
+      <label class="btn block taupe" style="cursor:pointer">${icon(I.upload)}Add files (PDF, XXL)
+        <input type="file" id="file-input" multiple hidden ${isIOS ? '' : 'accept=".pdf,.xxl"'}>
+      </label>
+      <div class="small muted" style="margin:8px 2px 12px">Up to 50 MB each. Tap a file to open or download it.</div>
+      <div id="file-uploading"></div>
+      <div id="file-list" class="file-list">${fileList(r.id)}</div>
+      ${r.filesLink ? `<div class="small" style="margin-top:14px">Older link: ${driveUrl(r.filesLink) ? `<a href="${esc(driveUrl(r.filesLink))}" target="_blank" rel="noopener" style="color:var(--taupe-700);font-weight:600">${esc(r.filesLink)}</a>` : esc(r.filesLink)}</div>` : ''}
+    </div>
+
+    ${canChat() ? `<div class="pane chat-pane" data-pane="chat" ${tab === 'chat' ? '' : 'hidden'}>
+      <div class="small muted" style="margin-bottom:8px">Private to ${chatPeople().map(p => esc(p.name)).join(', ')}.</div>
+      <div id="chat-list" class="chat-list">${chatList(r.id)}</div>
+      <form id="chat-form" class="chat-compose">
+        <div class="tag-row">${chatPeople().filter(p => p.email.toLowerCase() !== myEmail()).map(p => `<button type="button" data-tag="${esc(p.name)}">@${esc(p.name)}</button>`).join('')}</div>
+        <div class="compose-row">
+          <textarea name="text" rows="1" placeholder="Message… type @ to tag" aria-label="Message"></textarea>
+          <button class="send" type="submit" aria-label="Send">${icon('<path d="M4 12 20 4l-6 16-3-7z"/>')}</button>
+        </div>
+      </form>
+    </div>` : ''}
   `, sheet => {
+    S.openRoom = { id, tab };
+    const show = k => {
+      S.openRoom.tab = k;
+      $$('.tabs button', sheet).forEach(b => b.classList.toggle('on', b.dataset.tab === k));
+      $$('.pane', sheet).forEach(p => { p.hidden = p.dataset.pane !== k; });
+      if (k === 'chat') { const l = $('#chat-list', sheet); l.scrollTop = l.scrollHeight; markRoomRead(id); }
+      if (k === 'files') { $$('a[data-signed]', sheet).forEach(a => delete a.dataset.signed); signFileLinks(sheet); } // fresh links each visit
+    };
+    $('.tabs', sheet).onclick = e => { const b = e.target.closest('[data-tab]'); if (b) show(b.dataset.tab); };
+    show(tab);
+
     $('#room-form', sheet).onsubmit = async e => {
       e.preventDefault();
-      await save('rooms', { ...r, ...formData(e.target) });
+      // Start from the latest copy so materials, stage or teammates' changes made since opening are kept.
+      await save('rooms', { ...S.db.rooms.find(x => x.id === id), ...formData(e.target) });
       closeSheet(); toast('Room saved'); render(true);
     };
+
+    const matForm = $('#room-mat-form', sheet);
+    wireEst(matForm);
+    matForm.onsubmit = async e => {
+      e.preventDefault();
+      await save('rooms', { ...S.db.rooms.find(x => x.id === id), materials: readEst(matForm) });
+      $('#room-mat-status', sheet).innerHTML = roomMaterialStatus(id);
+      refreshOpenRoom(); render(true); toast('Materials saved');
+    };
+
+    signFileLinks(sheet);
+    // A link that isn't ready yet (slow connection) opens the file once its address arrives.
+    $('#file-list', sheet).addEventListener('click', e => {
+      const a = e.target.closest('a[data-file]');
+      if (a && !a.dataset.signed) { e.preventDefault(); openFile(a.dataset.file); }
+    });
+    $('#file-input', sheet).onchange = async e => {
+      const files = [...e.target.files]; e.target.value = '';
+      for (const file of files) await uploadRoomFile(r, file, $('#file-uploading', sheet));
+    };
+
+    const chat = $('#chat-form', sheet);
+    if (chat) {
+      const ta = $('textarea', chat);
+      const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'; };
+      ta.addEventListener('input', grow);
+      ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !('ontouchstart' in window)) { e.preventDefault(); chat.requestSubmit(); } });
+      $('.tag-row', chat).onclick = e => {
+        const b = e.target.closest('[data-tag]'); if (!b) return;
+        const pos = ta.selectionStart ?? ta.value.length, before = ta.value.slice(0, pos), tag = `@${b.dataset.tag} `;
+        ta.value = before + (before && !/\s$/.test(before) ? ' ' : '') + tag + ta.value.slice(pos);
+        ta.focus(); grow(); buzz();
+      };
+      chat.onsubmit = async e => {
+        e.preventDefault();
+        const text = ta.value.trim(); if (!text) return;
+        ta.value = ''; grow();
+        await sendMessage(r, text);
+      };
+    }
   });
+}
+
+async function sendMessage(r, text) {
+  const mentions = chatPeople().filter(p => new RegExp(`@${p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text)).map(p => p.name);
+  const m = { id: uid(), roomId: r.id, projectId: r.projectId, by: S.me || '', byEmail: myEmail(), text, ts: new Date().toISOString(), mentions };
+  S.db.messages.push(m);
+  refreshOpenRoom();
+  const list = $('#chat-list'); if (list) list.scrollTop = list.scrollHeight;
+  try { await B.insert('messages', m); }
+  catch { S.db.messages = S.db.messages.filter(x => x.id !== m.id); refreshOpenRoom(); toast('Message not sent — check connection'); return; }
+  const p = project(r.projectId);
+  for (const name of mentions) {
+    await notify(name, { type: 'mention', roomId: r.id, projectId: r.projectId, room: r.name, client: p?.client || '', text: text.slice(0, 140) });
+  }
+  if (mentions.length) toast(`Pinged ${mentions.join(', ')}`);
+}
+
+async function uploadRoomFile(r, file, statusEl) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  if (!FILE_TYPES.includes(ext)) return toast(`${file.name}: only PDF and XXL files can be added`);
+  if (file.size > MAX_FILE) return toast(`${file.name} is larger than 50 MB`);
+  const row = document.createElement('div');
+  row.className = 'file-row uploading';
+  row.innerHTML = `<span class="file-ico ${ext}">${ext.toUpperCase()}</span><span class="grow ellipsis">${esc(file.name)}</span><span class="small muted">Uploading…</span>`;
+  statusEl?.appendChild(row);
+  const safe = file.name.normalize('NFKD').replace(/[^\w.\-]+/g, '_').slice(-80);
+  const path = `${r.projectId}/${r.id}/${uid()}-${safe}`;
+  try {
+    await B.uploadFile(path, file);
+    await save('files', { id: uid(), roomId: r.id, projectId: r.projectId, name: file.name, path, size: file.size, type: ext, by: S.me || '', ts: new Date().toISOString() });
+    toast(`${file.name} added`);
+  } catch (e) {
+    toast(`Could not upload ${file.name}`);
+  } finally {
+    row.remove(); refreshOpenRoom(); render(true);
+  }
+}
+
+// File links are private, short-lived web addresses. They're prepared as soon as the list shows,
+// so a tap is a normal link (phones, especially iPhone Home Screen apps, block tabs opened later).
+async function signFileLinks(root = document) {
+  for (const a of $$('a[data-file]', root)) {
+    if (a.dataset.signed) continue;
+    const f = (S.db.files || []).find(x => x.id === a.dataset.file); if (!f) continue;
+    try {
+      a.href = await B.fileUrl(f.path, f.type === 'pdf' ? undefined : f.name);
+      if (f.type !== 'pdf') a.setAttribute('download', f.name);
+      a.dataset.signed = '1';
+    } catch { /* tapping falls back to openFile */ }
+  }
+}
+async function openFile(id) {
+  const f = (S.db.files || []).find(x => x.id === id); if (!f) return;
+  try { location.href = await B.fileUrl(f.path, f.type === 'pdf' ? undefined : f.name); }
+  catch { toast('Could not open the file — check connection'); }
+}
+// Deletes a room's files from storage too (so they stop using space).
+async function deleteRoomFiles(roomId) {
+  for (const f of roomFiles(roomId)) {
+    await B.deleteFile(f.path).catch(() => {});
+    await remove('files', f.id).catch(() => {});
+  }
+}
+
+// Marks this room's chat notifications as read once you open the chat.
+function markRoomRead(roomId) {
+  for (const n of myNotifications().filter(n => !n.read && n.roomId === roomId && n.type === 'mention')) {
+    n.read = true; B.update('notifications', n).catch(() => {});
+  }
+  paintBell();
 }
 
 const estRow = r => `<div class="est-row">
@@ -743,9 +1149,34 @@ const estRow = r => `<div class="est-row">
   <button type="button" class="est-del" aria-label="Remove row">×</button>
 </div>`;
 
+// Name / Color code / Amount table with an "Add row" button (at least 3 rows to start).
+function estTable(rows, minRows = 3) {
+  return `<div class="est">
+      <div class="est-head"><span>Name</span><span>Color code</span><span>Amount</span><span></span></div>
+      ${[...rows, ...Array(Math.max(0, minRows - rows.length)).fill({})].map(estRow).join('')}
+    </div>
+    <button type="button" class="btn ghost sm est-add" style="justify-self:start">${icon(I.plus)}Add row</button>
+    <datalist id="stock-names">${S.db.materials.map(m => `<option value="${esc(m.name)}">${esc(m.colorCode)}</option>`).join('')}</datalist>`;
+}
+function wireEst(root) {
+  const est = $('.est', root);
+  $('.est-add', root).onclick = () => { est.insertAdjacentHTML('beforeend', estRow({})); $('.est-row:last-child input', est).focus(); };
+  est.addEventListener('click', e => { if (e.target.closest('.est-del')) e.target.closest('.est-row').remove(); });
+  // Picking a material that is already in stock fills in its color code.
+  est.addEventListener('change', e => {
+    if (e.target.name !== 'mname') return;
+    const code = $('[name=mcode]', e.target.closest('.est-row')), m = S.db.materials.find(x => norm(x.name) === norm(e.target.value));
+    if (m && !code.value) code.value = m.colorCode || '';
+  });
+}
+const readEst = root => $$('.est-row', root)
+  .map(r => ({ name: $('[name=mname]', r).value.trim(), colorCode: $('[name=mcode]', r).value.trim(), qty: $('[name=mqty]', r).value === '' ? '' : Math.max(0, +$('[name=mqty]', r).value) }))
+  .filter(r => r.name || r.colorCode);
+
 function sheetProject(id) {
   const p = id ? project(id) : null;
   const nextId = 'HK-' + String(Math.max(0, ...S.db.projects.map(x => +x.id.replace(/\D/g, '') || 0)) + 1).padStart(3, '0');
+  const legacy = p ? estimateRows(p) : [];
   openSheet(`
     <div class="sheet-head"><div><div class="eyebrow">${p ? esc(p.id) : `New job · ${nextId}`}</div><h2>${p ? 'Edit job' : 'New project'}</h2></div></div>
     <form class="form" id="proj-form">
@@ -753,14 +1184,10 @@ function sheetProject(id) {
       ${field('Address', 'address', p?.address, 'text', 'autocomplete="street-address"')}
       ${field('Target completion', 'targetDate', p?.targetDate, 'date')}
       ${field('Drive folder link (opens with “Project Documents”)', 'driveLink', p?.driveLink, 'text', 'placeholder="https://drive.google.com/drive/folders/…" inputmode="url" autocomplete="off"')}
-      <div class="field"><span>Raw material estimate</span>
-        <div class="est" id="est">
-          <div class="est-head"><span>Name</span><span>Color code</span><span>Amount</span><span></span></div>
-          ${(() => { const rows = p ? estimateRows(p) : []; return [...rows, ...Array(Math.max(0, 3 - rows.length)).fill({})].map(estRow).join(''); })()}
-        </div>
-        <button type="button" class="btn ghost sm" id="est-add" style="justify-self:start">${icon(I.plus)}Add row</button>
-        <datalist id="stock-names">${S.db.materials.map(m => `<option value="${esc(m.name)}">${esc(m.colorCode)}</option>`).join('')}</datalist>
-      </div>
+      ${legacy.length ? `<div class="field" id="legacy-est"><span>Older job-level material list</span>
+        <div class="small muted" style="margin-bottom:4px">Raw materials now go in each room (room → Materials tab). Move these lines into the right rooms, then delete them here.</div>
+        ${estTable(legacy, 0)}
+      </div>` : ''}
       ${field('Hardware estimate', 'hardwareEstimate', p?.hardwareEstimate, 'textarea', 'placeholder="e.g. 42 soft-close hinges, 14 drawer slides"')}
       ${field('Notes', 'notes', p?.notes, 'textarea')}
       <div class="sheet-actions ${p ? 'two' : ''}">
@@ -768,22 +1195,12 @@ function sheetProject(id) {
         <button class="btn" type="submit">${p ? 'Save' : 'Create & add rooms'}</button>
       </div>
     </form>`, sheet => {
-    const est = $('#est', sheet);
-    $('#est-add', sheet).onclick = () => { est.insertAdjacentHTML('beforeend', estRow({})); $('.est-row:last-child input', est).focus(); };
-    est.addEventListener('click', e => { if (e.target.closest('.est-del')) e.target.closest('.est-row').remove(); });
-    // Picking a material that is already in stock fills in its color code.
-    est.addEventListener('change', e => {
-      if (e.target.name !== 'mname') return;
-      const code = $('[name=mcode]', e.target.closest('.est-row')), m = S.db.materials.find(x => norm(x.name) === norm(e.target.value));
-      if (m && !code.value) code.value = m.colorCode || '';
-    });
+    const legacyBox = $('#legacy-est', sheet);
+    if (legacyBox) wireEst(legacyBox);
     $('#proj-form', sheet).onsubmit = async e => {
       e.preventDefault();
       const { mname, mcode, mqty, ...data } = formData(e.target);
-      data.materials = $$('.est-row', est)
-        .map(r => ({ name: $('[name=mname]', r).value.trim(), colorCode: $('[name=mcode]', r).value.trim(), qty: $('[name=mqty]', r).value === '' ? '' : Math.max(0, +$('[name=mqty]', r).value) }))
-        .filter(r => r.name || r.colorCode);
-      data.materialEstimate = '';
+      if (legacyBox) { data.materials = readEst(legacyBox); data.materialEstimate = ''; }
       const item = p ? { ...p, ...data } : { id: nextId, createdAt: new Date().toISOString(), ...data };
       await save('projects', item);
       toast(p ? 'Job saved' : `${item.client} created`);
@@ -875,6 +1292,7 @@ function sheetMenu() {
   openSheet(`
     <div class="sheet-head"><div class="row"><span class="avatar" style="width:48px;height:48px;font-size:18px">${initials(S.me || '?')}</span><div><h2>${esc(S.me || 'Who are you?')}</h2><div class="sub">${esc(personEmail(S.me) || 'Hakan Interiors')}</div></div></div></div>
     <div class="menu">
+      <button data-action="bell"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 1 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/></svg>Notifications${unreadCount() ? ` <span class="badge bad">${unreadCount()}</span>` : ''}</button>
       <button data-action="who">${icon(I.users)}Switch person</button>
       <button data-action="go" data-href="#/activity">${icon(I.activity)}Activity log</button>
       <button data-action="go" data-href="#/settings">${icon(I.settings)}Team & settings</button>
@@ -933,14 +1351,20 @@ async function setStage(id, n) {
   closeSheet(); render(true);
   if (n === 7) celebrate();
   const owner = stage(n).owner, email = personEmail(owner);
+  // The new stage's owner gets a notification once the Undo window has passed.
+  const notifyTimer = n < 7 && owner && owner !== S.me ? setTimeout(() => notify(owner, {
+    type: 'stage', roomId: r.id, projectId: r.projectId, room: r.name, client: p?.client || '', from: prev.stage, to: n,
+    text: `${r.name} is ready for ${stage(n).name}`,
+  }), 5500) : null;
   toast(n === 7 ? `${r.name} completed 🎉` : `${r.name} → ${stage(n).name}${owner ? ` · ${owner}` : ''}`, {
     label: 'Undo', fn: async () => {
+      clearTimeout(notifyTimer);
       await save('rooms', { ...r, ...prev });
       await remove('log', entry.id);
       render(true); toast('Change undone');
     },
   });
-  if (email && owner !== S.me && n < 7) setTimeout(() => toast(`Let ${owner} know?`, {
+  if (email && owner !== S.me && n < 7) setTimeout(() => toast(`${owner} was notified in the app. Email too?`, {
     label: 'Email', fn: () => { location.href = `mailto:${email}?subject=${encodeURIComponent(`${p?.client || ''} – ${r.name} is ready for ${stage(n).name}`)}&body=${encodeURIComponent(`Hi ${owner},\n\n${r.name} (${r.id}) for ${p?.client || r.projectId} just moved to ${stageLabel(n)}.\n${r.nextAction ? `Next action: ${r.nextAction}\n` : ''}\nOpen the tracker: ${location.href.split('#')[0]}#/project/${encodeURIComponent(r.projectId)}\n\n— ${S.me || 'Hakan team'}`)}`; },
   }), 5200);
 }
@@ -995,7 +1419,7 @@ function download(name, text, type) {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 function toCSV(col) {
-  const rows = S.db[col].map(x => col === 'rooms' ? { ...x, client: project(x.projectId)?.client || '', stage: stageLabel(x.stage), owner: stage(x.stage).owner, daysInStage: daysIn(x) ?? '' } : col === 'projects' ? (({ materialEstimate, ...p }) => ({ ...p, materials: estimateRows(x).map(l => `${l.name}${l.colorCode ? ` (${l.colorCode})` : ''}${l.qty !== '' ? ` x ${l.qty}` : ''}`).join('; '), rooms: progress(x.id).total, completed: progress(x.id).done }))(x) : (({ reorderAt, ...m }) => ({ ...m, reservedForJobs: materialPlan().reserved.get(x.id) || 0, toOrder: materialPlan().orders.find(o => o.stock?.id === x.id)?.short || 0 }))(x));
+  const rows = S.db[col].map(x => col === 'rooms' ? { ...x, client: project(x.projectId)?.client || '', stage: stageLabel(x.stage), owner: stage(x.stage).owner, daysInStage: daysIn(x) ?? '', materials: roomRows(x).map(l => `${l.name}${l.colorCode ? ` (${l.colorCode})` : ''}${l.qty !== '' ? ` x ${l.qty}` : ''}`).join('; '), files: roomFiles(x.id).map(f => f.name).join('; ') } : col === 'projects' ? (({ materialEstimate, ...p }) => ({ ...p, materials: estimateRows(x).map(l => `${l.name}${l.colorCode ? ` (${l.colorCode})` : ''}${l.qty !== '' ? ` x ${l.qty}` : ''}`).join('; '), rooms: progress(x.id).total, completed: progress(x.id).done }))(x) : (({ reorderAt, ...m }) => ({ ...m, reservedForJobs: materialPlan().reserved.get(x.id) || 0, toOrder: materialPlan().orders.find(o => o.stock?.id === x.id)?.short || 0 }))(x));
   const keys = [...new Set(rows.flatMap(Object.keys))];
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   return '﻿' + [keys.map(q).join(','), ...rows.map(r => keys.map(k => q(r[k])).join(','))].join('\r\n');
@@ -1012,12 +1436,41 @@ const actions = {
     toast('Paste the Google Drive folder link here');
     setTimeout(() => { input.scrollIntoView({ block: 'center', behavior: 'smooth' }); input.focus(); input.select(); }, 380);
   },
-  'delete-project': async el => { const p = project(el.dataset.id); if (!confirm(`Delete ${p.client} and all ${roomsOf(p.id).length} of its rooms? This cannot be undone.`)) return; await remove('projects', p.id); closeSheet(); location.hash = '#/projects'; toast('Project deleted'); },
+  'delete-project': async el => {
+    const p = project(el.dataset.id); if (!confirm(`Delete ${p.client} and all ${roomsOf(p.id).length} of its rooms, including their files? This cannot be undone.`)) return;
+    for (const r of roomsOf(p.id)) await deleteRoomFiles(r.id);
+    await remove('projects', p.id); closeSheet(); location.hash = '#/projects'; toast('Project deleted');
+  },
   'add-rooms': el => sheetAddRooms(el.dataset.id),
   room: el => sheetRoom(el.dataset.id),
+  'room-tab': el => sheetRoom(el.dataset.id, el.dataset.tab),
+  bell: () => { closeSheet(); location.hash = '#/notifications'; },
+  'open-notif': el => openNotification(el.dataset.id),
+  'push-on': () => enablePush(),
+  'push-off': () => disablePush(),
+  'push-test': () => sendTestPush().catch(() => toast('Could not send the test')),
+  'read-all': () => {
+    for (const n of myNotifications().filter(n => !n.read)) { n.read = true; B.update('notifications', n).catch(() => {}); }
+    paintBell(); render(true); toast('All caught up');
+  },
+  'open-file': el => openFile(el.dataset.id),
+  'delete-file': async el => {
+    const f = S.db.files.find(x => x.id === el.dataset.id); if (!f || !confirm(`Delete ${f.name}? This cannot be undone.`)) return;
+    try { await B.deleteFile(f.path); } catch { /* the record is removed even if the stored copy was already gone */ }
+    await remove('files', f.id); refreshOpenRoom(); render(true); toast('File deleted');
+  },
+  'delete-msg': async el => {
+    if (!confirm('Delete this message?')) return;
+    await remove('messages', el.dataset.id); refreshOpenRoom();
+  },
   advance: el => { const r = S.db.rooms.find(x => x.id === el.dataset.id); if (r && r.stage < 7) setStage(r.id, r.stage + 1); },
   'set-stage': el => setStage(el.dataset.id, +el.dataset.n),
-  'delete-room': async el => { if (!confirm('Delete this room?')) return; await remove('rooms', el.dataset.id); closeSheet(); render(true); toast('Room deleted'); },
+  'delete-room': async el => {
+    const n = roomFiles(el.dataset.id).length;
+    if (!confirm(`Delete this room${n ? ` and its ${n} file${n > 1 ? 's' : ''}` : ''}?`)) return;
+    await deleteRoomFiles(el.dataset.id);
+    await remove('rooms', el.dataset.id); closeSheet(); render(true); toast('Room deleted');
+  },
   'new-material': () => sheetMaterial(),
   received: el => receiveOrder(el.dataset.key),
   'toggle-ordered': el => toggleOrdered(el.dataset.key),
@@ -1114,8 +1567,19 @@ async function render(keepScroll) {
   const q = new URLSearchParams(qs || '');
   const y = scrollY;
   S.disposeHero?.(); S.disposeHero = null;
-  const html = { home: viewHome, projects: () => viewProjects(q), project: () => viewProject(arg), board: () => viewBoard(q), stock: () => viewStock(q), activity: viewActivity, settings: viewSettings }[page]?.() ?? viewHome();
+  const html = { home: viewHome, projects: () => viewProjects(q), project: () => viewProject(arg), board: () => viewBoard(q), stock: () => viewStock(q), activity: viewActivity, settings: viewSettings, notifications: viewNotifications }[page]?.() ?? viewHome();
   view.innerHTML = `<div>${html}</div>`;
+  paintBell();
+  $('#bell')?.classList.toggle('on', page === 'notifications');
+  if (page === 'notifications') {
+    paintPushCard();
+    // Opened from a phone notification: #/notifications?open=<id>
+    const openId = q.get('open');
+    if (openId) {
+      history.replaceState(null, '', '#/notifications');
+      (async () => { if (!myNotifications().some(n => n.id === openId)) await refresh(); openNotification(openId); })();
+    }
+  }
   const tab = page === 'project' ? 'projects' : page;
   $$('.tabbar a').forEach(a => a.classList.toggle('on', a.dataset.tab === tab));
   if (keepScroll) scrollTo(0, y); else scrollTo(0, 0);
@@ -1204,14 +1668,25 @@ async function start() {
   // Signed-in users are matched to the team list by email.
   const byEmail = S.user && set().people.find(p => p.email && p.email.toLowerCase() === S.user.email.toLowerCase());
   if (byEmail) { S.me = byEmail.name; lsSet('hakan.me', S.me); }
+  S.chatMembers = await B.chatMembers().catch(() => []);
+  myNotifications().forEach(n => S.seenNotifs.add(n.id)); // only notifications arriving from now on pop up
   paintMe();
   lastPath = location.hash.split('?')[0];
   render();
   hideSplash();
+  const unread = unreadCount();
+  if (unread) setTimeout(() => toast(`🔔 You have ${unread} unread notification${unread > 1 ? 's' : ''}`, { label: 'View', fn: () => { location.hash = '#/notifications'; } }), 1200);
   if (!S.me || !set().people.some(p => p.name === S.me)) setTimeout(sheetWho, 700);
   B.watch(refresh);
   setInterval(() => S.db && lsSet('hakan.cache', JSON.stringify(S.db)), 30000);
-  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
+  syncPush().catch(() => {});
+  // Offer phone notifications once per device, after the user has had a moment with the app.
+  setTimeout(async () => {
+    if (lsGet('hakan.pushAsked') || await pushState() !== 'off') return;
+    lsSet('hakan.pushAsked', '1');
+    toast('Get notifications on this phone, even when the app is closed?', { label: 'Turn on', fn: enablePush });
+  }, unread ? 7000 : 2500);
 }
 
 (async function boot() {
