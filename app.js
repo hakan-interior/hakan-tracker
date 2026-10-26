@@ -184,7 +184,7 @@ function announceNew() {
   fresh.forEach(n => S.seenNotifs.add(n.id));
   paintBell();
   const n = fresh[0]; if (!n) return;
-  if (n.type === 'mention' && S.openRoom?.id === n.roomId && S.openRoom.tab === 'chat') { markRoomRead(n.roomId); return; }
+  if (n.type === 'mention' && S.openRoom?.id === n.roomId && S.openRoom.tab === 'overview') { markRoomRead(n.roomId); return; }
   navigator.vibrate?.([30, 60, 30]);
   toast(`🔔 ${notifTitle(n)}`, { label: 'Open', fn: () => openNotification(n.id) });
 }
@@ -888,7 +888,21 @@ const roomFiles = id => (S.db.files || []).filter(f => f.roomId === id).sort((a,
 const myNotifications = () => (S.db.notifications || []).filter(n => (n.toEmail || '').toLowerCase() === myEmail()).sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
 const unreadCount = () => myNotifications().filter(n => !n.read).length;
 const fmtSize = b => b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`;
-const FILE_TYPES = ['pdf', 'xxl'];
+// Allowed room files: drawings, CNC programs, photos and videos.
+const FILE_KINDS = {
+  pdf: 'pdf', xxl: 'xxl',
+  jpg: 'image', jpeg: 'image', png: 'image', heic: 'image', heif: 'image', webp: 'image', gif: 'image',
+  mp4: 'video', mov: 'video', m4v: 'video', webm: 'video', '3gp': 'video',
+};
+const FILE_TYPES = Object.keys(FILE_KINDS);
+const fileKind = f => FILE_KINDS[(f.type || '').toLowerCase()] || 'other';
+// Photos and videos picked on a phone sometimes have no extension; fall back to their type.
+const fileExt = file => {
+  const ext = file.name.includes('.') ? file.name.split('.').pop().toLowerCase() : '';
+  if (FILE_KINDS[ext]) return ext;
+  const fromMime = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/heic': 'heic', 'image/heif': 'heif', 'image/webp': 'webp', 'image/gif': 'gif', 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm' }[file.type];
+  return fromMime || ext;
+};
 const MAX_FILE = 50 * 1048576;
 
 // Sends a notification to a teammate by name (skips yourself and people without an email).
@@ -906,29 +920,36 @@ function chatText(text) {
   if (names.length) html = html.replace(new RegExp(`@(${names.join('|')})\\b`, 'gi'), '<b class="tag">@$1</b>');
   return html;
 }
+// Chat messages as rows, styled like the stage list.
 function chatList(roomId) {
   const msgs = roomMessages(roomId);
-  if (!msgs.length) return '<div class="chat-empty">No messages yet. Start the conversation, and tag someone with @ to ping them.</div>';
-  let lastDay = '';
+  if (!msgs.length) return '<div class="row-empty">No messages yet. Tag someone with @ to ping them.</div>';
   return msgs.map(m => {
-    const day = new Date(m.ts).toDateString(), mine = (m.byEmail || '').toLowerCase() === myEmail();
-    const sep = day !== lastDay ? `<div class="chat-day">${new Date(m.ts).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</div>` : '';
-    lastDay = day;
-    return `${sep}<div class="msg ${mine ? 'mine' : ''}">
-      ${mine ? '' : `<span class="mini-av">${initials(m.by)}</span>`}
-      <div class="bubble"><div class="msg-meta">${mine ? 'You' : esc(m.by)} · ${new Date(m.ts).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}${mine ? ` · <button data-action="delete-msg" data-id="${esc(m.id)}">delete</button>` : ''}</div>${chatText(m.text)}</div>
+    const mine = (m.byEmail || '').toLowerCase() === myEmail(), d = new Date(m.ts);
+    const when = `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} · ${d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+    return `<div class="lrow crow ${mine ? 'mine' : ''}">
+      <span class="num">${initials(m.by)}</span>
+      <div class="grow" style="min-width:0">
+        <div class="lrow-head"><span class="nm">${mine ? 'You' : esc(m.by)}</span><span class="ow">${when}</span>${mine ? `<button class="lrow-del" data-action="delete-msg" data-id="${esc(m.id)}" aria-label="Delete message">${icon(I.trash)}</button>` : ''}</div>
+        <div class="crow-text">${chatText(m.text)}</div>
+      </div>
     </div>`;
   }).join('');
 }
+// Room files as rows, styled like the stage list. Photos show a small preview.
 function fileList(roomId) {
   const files = roomFiles(roomId);
-  return files.map(f => `<div class="file-row">
-      <a class="file-open" data-file="${esc(f.id)}" href="#" target="_blank" rel="noopener">
-        <span class="file-ico ${esc(f.type)}">${esc((f.type || '').toUpperCase())}</span>
-        <span class="grow" style="min-width:0"><span class="title ellipsis" style="display:block">${esc(f.name)}</span><span class="sub">${fmtSize(f.size || 0)} · ${esc(f.by || '')} · ${fmtDate((f.ts || '').slice(0, 10))}</span></span>
+  return files.map(f => {
+    const kind = fileKind(f), label = kind === 'image' ? 'IMG' : kind === 'video' ? 'VID' : (f.type || '').toUpperCase().slice(0, 4);
+    return `<div class="lrow frow">
+      <a class="frow-open" data-file="${esc(f.id)}" href="#" target="_blank" rel="noopener">
+        <span class="num fthumb ${kind}">${kind === 'image' || kind === 'video' ? `<img data-thumb="${esc(f.id)}" alt="" hidden>` : ''}<span>${esc(label)}</span>${kind === 'video' ? '<i class="play" aria-hidden="true"></i>' : ''}</span>
+        <span class="grow" style="min-width:0"><span class="nm ellipsis">${esc(f.name)}</span><span class="ow">${fmtSize(f.size || 0)} · ${esc(f.by || '')} · ${fmtDate((f.ts || '').slice(0, 10))}</span></span>
       </a>
-      <button class="icon-btn" data-action="delete-file" data-id="${esc(f.id)}" aria-label="Delete ${esc(f.name)}">${icon(I.trash)}</button>
-    </div>`).join('') || '<div class="chat-empty">No files yet. Add the room’s drawings (PDF) and CNC programs (XXL).</div>';
+      <button class="lrow-del lrow-edit" data-action="rename-file" data-id="${esc(f.id)}" aria-label="Rename ${esc(f.name)}">${icon(I.edit)}</button>
+      <button class="lrow-del" data-action="delete-file" data-id="${esc(f.id)}" aria-label="Delete ${esc(f.name)}">${icon(I.trash)}</button>
+    </div>`;
+  }).join('') || '<div class="row-empty">No files yet. Add drawings (PDF), CNC programs (XXL), photos or videos.</div>';
 }
 function roomMaterialStatus(roomId) {
   const lines = materialPlan().byRoom.get(roomId) || [];
@@ -946,18 +967,21 @@ function refreshOpenRoom() {
     list.innerHTML = chatList(o.id);
     if (atBottom) list.scrollTop = list.scrollHeight;
   }
-  const files = $('#file-list'); if (files) { files.innerHTML = fileList(o.id); signFileLinks(files); }
+  const files = $('#file-list'); // left alone while someone is typing a new file name
+  if (files && !$('.rename-box', files)) { files.innerHTML = fileList(o.id); signFileLinks(files); }
   const n = (sel, v) => { const el = $(sel); if (el) el.textContent = v || ''; };
-  n('#tab-n-chat', roomMessages(o.id).length); n('#tab-n-files', roomFiles(o.id).length); n('#tab-n-materials', roomRows(S.db.rooms.find(r => r.id === o.id) || {}).length);
+  n('#chat-n', roomMessages(o.id).length); n('#files-n', roomFiles(o.id).length); n('#tab-n-materials', roomRows(S.db.rooms.find(r => r.id === o.id) || {}).length);
 }
 
+// tab: 'overview' | 'materials'; 'files' or 'chat' open Overview scrolled to that section.
 function sheetRoom(id, tab = 'overview') {
   const r = S.db.rooms.find(x => x.id === id); if (!r) return;
-  if (tab === 'chat' && !canChat()) tab = 'overview';
+  const focus = ['files', 'chat'].includes(tab) ? tab : null;
+  if (focus) tab = 'overview';
   const p = project(r.projectId), d = daysIn(r);
   const hist = S.db.log.filter(l => l.roomId === id).slice().reverse();
-  const tabs = [['overview', 'Overview'], ['materials', 'Materials'], ['files', 'Files'], ...(canChat() ? [['chat', 'Chat']] : [])];
-  const count = { materials: roomRows(r).length, files: roomFiles(id).length, chat: roomMessages(id).length };
+  const tabs = [['overview', 'Overview'], ['materials', 'Materials']];
+  const count = { materials: roomRows(r).length };
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   openSheet(`
     <div class="sheet-head"><div style="min-width:0"><div class="eyebrow">${esc(p?.client || r.projectId)} · ${esc(r.id)}</div><h2>${esc(r.name)}</h2>
@@ -968,6 +992,30 @@ function sheetRoom(id, tab = 'overview') {
 
     <div class="pane" data-pane="overview" ${tab === 'overview' ? '' : 'hidden'}>
       ${r.stage < 7 ? `<button class="btn block taupe" data-action="advance" data-id="${esc(r.id)}" style="height:54px;font-size:16px">${r.stage === 6 ? 'Mark completed ✓' : `Move to ${esc(stageLabel(r.stage + 1))}`} ${icon(I.arrow)}</button>` : ''}
+
+      <div id="room-files" class="room-section">
+        <div class="eyebrow" style="margin:18px 0 6px">Files <span id="files-n" class="sec-n">${roomFiles(id).length || ''}</span></div>
+        <label class="btn block ghost add-files">${icon(I.upload)}Add files
+          <input type="file" id="file-input" multiple hidden ${isIOS ? '' : 'accept=".pdf,.xxl,image/*,video/*"'}>
+        </label>
+        <div class="small muted" style="margin:6px 2px 8px">PDF, XXL, photos and videos · up to 50 MB each</div>
+        <div id="file-uploading" class="stepper"></div>
+        <div id="file-list" class="stepper">${fileList(r.id)}</div>
+        ${r.filesLink ? `<div class="small" style="margin-top:8px">Older link: ${driveUrl(r.filesLink) ? `<a href="${esc(driveUrl(r.filesLink))}" target="_blank" rel="noopener" style="color:var(--taupe-700);font-weight:600">${esc(r.filesLink)}</a>` : esc(r.filesLink)}</div>` : ''}
+      </div>
+
+      ${canChat() ? `<div id="room-chat" class="room-section">
+        <div class="eyebrow" style="margin:18px 0 6px">Chat <span id="chat-n" class="sec-n">${roomMessages(id).length || ''}</span> <span class="eyebrow-note">· private to ${chatPeople().map(p => esc(p.name)).join(', ')}</span></div>
+        <div id="chat-list" class="stepper chat-list">${chatList(r.id)}</div>
+        <form id="chat-form" class="chat-compose">
+          <div class="tag-row">${chatPeople().filter(p => p.email.toLowerCase() !== myEmail()).map(p => `<button type="button" data-tag="${esc(p.name)}">@${esc(p.name)}</button>`).join('')}</div>
+          <div class="compose-row">
+            <textarea name="text" rows="1" placeholder="Message… tap a name to tag" aria-label="Message"></textarea>
+            <button class="send" type="submit" aria-label="Send">${icon('<path d="M4 12 20 4l-6 16-3-7z"/>')}</button>
+          </div>
+        </form>
+      </div>` : ''}
+
       <div class="eyebrow" style="margin:18px 0 6px">Stage — tap to change</div>
       <div class="stepper">${stages().map(s => `<button data-action="set-stage" data-id="${esc(r.id)}" data-n="${s.n}" class="${s.n < r.stage ? 'done' : s.n === r.stage ? 'cur' : ''}"><span class="num">${s.n < r.stage ? '✓' : s.n}</span><span class="nm">${esc(s.name)}</span><span class="ow">${esc(s.owner)}</span></button>`).join('')}</div>
       <form class="form" id="room-form" style="margin-top:18px">
@@ -989,39 +1037,21 @@ function sheetRoom(id, tab = 'overview') {
       </form>
       <div id="room-mat-status">${roomMaterialStatus(r.id)}</div>
     </div>
-
-    <div class="pane" data-pane="files" ${tab === 'files' ? '' : 'hidden'}>
-      <label class="btn block taupe" style="cursor:pointer">${icon(I.upload)}Add files (PDF, XXL)
-        <input type="file" id="file-input" multiple hidden ${isIOS ? '' : 'accept=".pdf,.xxl"'}>
-      </label>
-      <div class="small muted" style="margin:8px 2px 12px">Up to 50 MB each. Tap a file to open or download it.</div>
-      <div id="file-uploading"></div>
-      <div id="file-list" class="file-list">${fileList(r.id)}</div>
-      ${r.filesLink ? `<div class="small" style="margin-top:14px">Older link: ${driveUrl(r.filesLink) ? `<a href="${esc(driveUrl(r.filesLink))}" target="_blank" rel="noopener" style="color:var(--taupe-700);font-weight:600">${esc(r.filesLink)}</a>` : esc(r.filesLink)}</div>` : ''}
-    </div>
-
-    ${canChat() ? `<div class="pane chat-pane" data-pane="chat" ${tab === 'chat' ? '' : 'hidden'}>
-      <div class="small muted" style="margin-bottom:8px">Private to ${chatPeople().map(p => esc(p.name)).join(', ')}.</div>
-      <div id="chat-list" class="chat-list">${chatList(r.id)}</div>
-      <form id="chat-form" class="chat-compose">
-        <div class="tag-row">${chatPeople().filter(p => p.email.toLowerCase() !== myEmail()).map(p => `<button type="button" data-tag="${esc(p.name)}">@${esc(p.name)}</button>`).join('')}</div>
-        <div class="compose-row">
-          <textarea name="text" rows="1" placeholder="Message… type @ to tag" aria-label="Message"></textarea>
-          <button class="send" type="submit" aria-label="Send">${icon('<path d="M4 12 20 4l-6 16-3-7z"/>')}</button>
-        </div>
-      </form>
-    </div>` : ''}
   `, sheet => {
     S.openRoom = { id, tab };
     const show = k => {
       S.openRoom.tab = k;
       $$('.tabs button', sheet).forEach(b => b.classList.toggle('on', b.dataset.tab === k));
       $$('.pane', sheet).forEach(p => { p.hidden = p.dataset.pane !== k; });
-      if (k === 'chat') { const l = $('#chat-list', sheet); l.scrollTop = l.scrollHeight; markRoomRead(id); }
-      if (k === 'files') { $$('a[data-signed]', sheet).forEach(a => delete a.dataset.signed); signFileLinks(sheet); } // fresh links each visit
+      if (k === 'overview') {
+        const l = $('#chat-list', sheet); if (l) { l.scrollTop = l.scrollHeight; markRoomRead(id); }
+        $$('a[data-signed]', sheet).forEach(a => delete a.dataset.signed); signFileLinks(sheet); // fresh file links each visit
+      }
     };
     $('.tabs', sheet).onclick = e => { const b = e.target.closest('[data-tab]'); if (b) show(b.dataset.tab); };
     show(tab);
+    // Opened from a Files/Chat shortcut or a chat notification: bring that section into view.
+    if (focus) setTimeout(() => $(`#room-${focus}`, sheet)?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 380);
 
     $('#room-form', sheet).onsubmit = async e => {
       e.preventDefault();
@@ -1087,19 +1117,57 @@ async function sendMessage(r, text) {
   if (mentions.length) toast(`Pinged ${mentions.join(', ')}`);
 }
 
+// Small square preview (JPEG) made on the phone at upload: a photo shrunk down, or a video's first frame.
+// Returns null if this device can't read the file (e.g. HEIC photos outside Safari); the row then shows a label.
+async function makeThumb(file, kind) {
+  const url = URL.createObjectURL(file);
+  const timeout = ms => new Promise((_, no) => setTimeout(() => no(new Error('timeout')), ms));
+  try {
+    let src, w, h;
+    if (kind === 'image') {
+      const img = new Image();
+      await Promise.race([new Promise((ok, no) => { img.onload = ok; img.onerror = no; img.src = url; }), timeout(8000)]);
+      src = img; w = img.naturalWidth; h = img.naturalHeight;
+    } else {
+      const v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+      await Promise.race([new Promise((ok, no) => { v.onloadeddata = ok; v.onerror = no; }), timeout(10000)]);
+      v.currentTime = Math.min(0.1, (v.duration || 1) / 2);
+      await Promise.race([new Promise(ok => { v.onseeked = ok; }), timeout(5000)]);
+      src = v; w = v.videoWidth; h = v.videoHeight;
+    }
+    if (!w || !h) return null;
+    const size = 160, s = Math.min(w, h), c = document.createElement('canvas');
+    c.width = c.height = size;
+    c.getContext('2d').drawImage(src, (w - s) / 2, (h - s) / 2, s, s, 0, 0, size, size); // centre square crop
+    return await new Promise(ok => c.toBlob(ok, 'image/jpeg', 0.8));
+  } catch { return null; } finally { URL.revokeObjectURL(url); }
+}
+
 async function uploadRoomFile(r, file, statusEl) {
-  const ext = (file.name.split('.').pop() || '').toLowerCase();
-  if (!FILE_TYPES.includes(ext)) return toast(`${file.name}: only PDF and XXL files can be added`);
-  if (file.size > MAX_FILE) return toast(`${file.name} is larger than 50 MB`);
+  const ext = fileExt(file);
+  if (!FILE_TYPES.includes(ext)) return toast(`${file.name}: only PDF, XXL, photos and videos can be added`);
+  if (file.size > MAX_FILE) return toast(`${file.name} is larger than 50 MB${FILE_KINDS[ext] === 'video' ? ' — trim the video or share it through Project Documents' : ''}`);
+  const kind = FILE_KINDS[ext];
   const row = document.createElement('div');
-  row.className = 'file-row uploading';
-  row.innerHTML = `<span class="file-ico ${ext}">${ext.toUpperCase()}</span><span class="grow ellipsis">${esc(file.name)}</span><span class="small muted">Uploading…</span>`;
+  row.className = 'lrow frow uploading';
+  row.innerHTML = `<span class="num fthumb ${kind}"><span>${kind === 'image' ? 'IMG' : kind === 'video' ? 'VID' : ext.toUpperCase()}</span></span><span class="grow ellipsis nm">${esc(file.name)}</span><span class="ow">Uploading…</span>`;
   statusEl?.appendChild(row);
-  const safe = file.name.normalize('NFKD').replace(/[^\w.\-]+/g, '_').slice(-80);
+  const name = file.name.includes('.') ? file.name : `${file.name || 'photo'}.${ext}`;
+  const safe = name.normalize('NFKD').replace(/[^\w.\-]+/g, '_').slice(-80);
   const path = `${r.projectId}/${r.id}/${uid()}-${safe}`;
+  file = file.name === name ? file : new File([file], name, { type: file.type });
   try {
     await B.uploadFile(path, file);
-    await save('files', { id: uid(), roomId: r.id, projectId: r.projectId, name: file.name, path, size: file.size, type: ext, by: S.me || '', ts: new Date().toISOString() });
+    let thumbPath = '';
+    if (kind === 'image' || kind === 'video') {
+      const thumb = await makeThumb(file, kind);
+      if (thumb) {
+        thumbPath = `${path}.thumb.jpg`;
+        await B.uploadFile(thumbPath, new File([thumb], 'thumb.jpg', { type: 'image/jpeg' })).catch(() => { thumbPath = ''; });
+      }
+    }
+    await save('files', { id: uid(), roomId: r.id, projectId: r.projectId, name: file.name, path, thumbPath, size: file.size, type: ext, by: S.me || '', ts: new Date().toISOString() });
     toast(`${file.name} added`);
   } catch (e) {
     toast(`Could not upload ${file.name}`);
@@ -1110,26 +1178,79 @@ async function uploadRoomFile(r, file, statusEl) {
 
 // File links are private, short-lived web addresses. They're prepared as soon as the list shows,
 // so a tap is a normal link (phones, especially iPhone Home Screen apps, block tabs opened later).
+// PDFs, photos and videos open in the browser; XXL programs download.
+const opensInBrowser = f => ['pdf', 'image', 'video'].includes(fileKind(f));
 async function signFileLinks(root = document) {
   for (const a of $$('a[data-file]', root)) {
     if (a.dataset.signed) continue;
     const f = (S.db.files || []).find(x => x.id === a.dataset.file); if (!f) continue;
     try {
-      a.href = await B.fileUrl(f.path, f.type === 'pdf' ? undefined : f.name);
-      if (f.type !== 'pdf') a.setAttribute('download', f.name);
+      a.href = await B.fileUrl(f.path, opensInBrowser(f) ? undefined : f.name);
+      if (!opensInBrowser(f)) a.setAttribute('download', f.name);
       a.dataset.signed = '1';
+      const img = $(`img[data-thumb="${CSS.escape(f.id)}"]`, a);
+      if (img && !img.src) {
+        if (f.thumbPath) { // small preview saved at upload
+          img.onload = () => { img.hidden = false; }; img.onerror = () => img.remove();
+          img.src = await B.fileUrl(f.thumbPath);
+        } else if (fileKind(f) === 'image') { // older photo: show the picture itself
+          img.onload = () => { img.hidden = false; }; img.onerror = () => img.remove(); img.src = a.href;
+        } else { // older video: let the browser show its first frame
+          const v = Object.assign(document.createElement('video'), { muted: true, playsInline: true, preload: 'metadata' });
+          v.className = 'thumb-video'; v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
+          v.onloadeddata = () => v.classList.add('ready'); v.onerror = () => v.remove();
+          v.src = `${a.href}#t=0.1`;
+          img.replaceWith(v);
+        }
+      }
     } catch { /* tapping falls back to openFile */ }
   }
 }
 async function openFile(id) {
   const f = (S.db.files || []).find(x => x.id === id); if (!f) return;
-  try { location.href = await B.fileUrl(f.path, f.type === 'pdf' ? undefined : f.name); }
+  try { location.href = await B.fileUrl(f.path, opensInBrowser(f) ? undefined : f.name); }
   catch { toast('Could not open the file — check connection'); }
 }
+// Rename a file in place: the name turns into a text box (Enter or tap away saves, Esc cancels).
+// Only the name people see changes; the extension is kept so the file still opens correctly.
+function renameFile(btn) {
+  const f = (S.db.files || []).find(x => x.id === btn.dataset.id); if (!f) return;
+  const row = btn.closest('.frow'), link = $('.frow-open', row);
+  const ext = f.name.includes('.') ? f.name.slice(f.name.lastIndexOf('.')) : `.${f.type}`;
+  const base = f.name.slice(0, f.name.length - ext.length) || f.name;
+  const box = document.createElement('div');
+  box.className = 'frow-open';
+  box.innerHTML = `${$('.fthumb', link).outerHTML}<span class="grow rename-box"><input type="text" value="${esc(base)}" maxlength="120" aria-label="New file name" enterkeyhint="done"><span class="ow">${esc(ext)} is kept</span></span>
+    <button type="button" class="rename-ok" aria-label="Save name">✓</button>`;
+  link.replaceWith(box);
+  $$('.lrow-del', row).forEach(b => { b.hidden = true; });
+  const input = $('input', box);
+  $('.rename-ok', box).addEventListener('pointerdown', e => e.preventDefault()); // keep the box focused so ✓ saves, not "tap away"
+  $('.rename-ok', box).addEventListener('click', () => finish(true));
+  input.focus(); input.select();
+  let done = false;
+  const finish = async keep => {
+    if (done) return; done = true;
+    const name = input.value.replace(/[\\/]+/g, '-').trim();
+    box.classList.remove('rename-box'); $('.rename-box', box)?.classList.remove('rename-box');
+    if (keep && name && name !== base) {
+      await save('files', { ...f, name: name + ext });
+      toast('File renamed');
+    }
+    refreshOpenRoom(); render(true);
+  };
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+}
+
 // Deletes a room's files from storage too (so they stop using space).
 async function deleteRoomFiles(roomId) {
   for (const f of roomFiles(roomId)) {
     await B.deleteFile(f.path).catch(() => {});
+    if (f.thumbPath) await B.deleteFile(f.thumbPath).catch(() => {});
     await remove('files', f.id).catch(() => {});
   }
 }
@@ -1454,9 +1575,11 @@ const actions = {
     paintBell(); render(true); toast('All caught up');
   },
   'open-file': el => openFile(el.dataset.id),
+  'rename-file': el => renameFile(el),
   'delete-file': async el => {
     const f = S.db.files.find(x => x.id === el.dataset.id); if (!f || !confirm(`Delete ${f.name}? This cannot be undone.`)) return;
     try { await B.deleteFile(f.path); } catch { /* the record is removed even if the stored copy was already gone */ }
+    if (f.thumbPath) await B.deleteFile(f.thumbPath).catch(() => {});
     await remove('files', f.id); refreshOpenRoom(); render(true); toast('File deleted');
   },
   'delete-msg': async el => {

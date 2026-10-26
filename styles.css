@@ -95,7 +95,49 @@ body.locked #bell { display: none; }
 .room-chip svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
 /* ---------- Room chat ---------- */
-.chat-list { display: flex; flex-direction: column; gap: 8px; max-height: 52dvh; min-height: 160px; overflow-y: auto; overscroll-behavior: contain; padding: 4px 2px 8px; }
+.chat-list { display: grid; gap: 6px; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
+
+/* Room overview: files and chat as rows matching the stage list */
+.lrow { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--white); min-width: 0; }
+.lrow .nm { display: block; font-weight: 600; font-size: 14px; }
+.lrow .ow { display: block; font-size: 12px; color: var(--muted); }
+.lrow-head { display: flex; align-items: baseline; gap: 8px; }
+.lrow-head .ow { display: inline; }
+.lrow-del { margin-left: auto; width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; color: var(--muted); flex-shrink: 0; }
+.lrow-del svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.lrow-del:active { background: #F6E7E4; color: var(--bad); }
+.crow { align-items: flex-start; }
+.crow .num { margin-top: 1px; }
+.crow.mine { background: var(--taupe-50); }
+.crow.mine .num { background: var(--ink); color: var(--taupe); }
+.crow-text { font-size: 14.5px; line-height: 1.4; margin-top: 2px; overflow-wrap: anywhere; }
+.frow { padding: 8px 6px 8px 8px; }
+.frow.uploading { background: var(--taupe-50); }
+.frow-open { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; text-align: left; }
+.lrow-edit + .lrow-del { margin-left: 0; }
+.lrow-del[hidden] { display: none; }
+.rename-box { display: grid; gap: 3px; }
+.rename-ok { width: 40px; height: 38px; border-radius: 10px; background: var(--ink); color: var(--taupe); font-size: 18px; font-weight: 700; flex-shrink: 0; }
+.rename-ok:active { transform: scale(.94); }
+.rename-box input { width: 100%; height: 38px; border-radius: 10px; border: 1.5px solid var(--taupe); background: var(--white); padding: 0 10px; font-size: 16px; font-weight: 600; outline: none; }
+.stepper .num.fthumb { width: 40px; height: 40px; border-radius: 9px; position: relative; overflow: hidden; font: 800 10px var(--display); letter-spacing: .04em; color: #fff; background: var(--taupe-700); }
+.stepper .num.fthumb.pdf { background: #A8483B; }
+.stepper .num.fthumb.xxl { background: var(--ink); color: var(--taupe); }
+.stepper .num.fthumb.image { background: #6B8CA8; }
+.stepper .num.fthumb.video { background: #7A5C8E; }
+.fthumb img, .fthumb .thumb-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.fthumb .thumb-video { opacity: 0; transition: opacity .2s; pointer-events: none; }
+.fthumb .thumb-video.ready { opacity: 1; }
+/* small ▶ badge on video previews */
+.fthumb .play { position: absolute; right: 3px; bottom: 3px; z-index: 1; width: 16px; height: 16px; border-radius: 50%; background: rgba(0,0,0,.6); }
+.fthumb .play::after { content: ""; position: absolute; left: 6px; top: 4px; border-style: solid; border-width: 4px 0 4px 6px; border-color: transparent transparent transparent #fff; }
+.row-empty { color: var(--muted); font-size: 13px; padding: 12px; border: 1.5px dashed var(--taupe-200); border-radius: 12px; background: var(--taupe-50); text-align: center; }
+.add-files { cursor: pointer; }
+.sec-n { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 4px; border-radius: 9px; background: var(--taupe-100); color: var(--taupe-700); font-size: 10.5px; letter-spacing: 0; vertical-align: 1px; }
+.sec-n:empty { display: none; }
+.eyebrow-note { text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--muted); font-family: var(--body); font-size: 11.5px; }
+#file-uploading:empty { display: none; }
+#file-uploading { margin-bottom: 6px; }
 .chat-empty { text-align: center; color: var(--muted); font-size: 13.5px; padding: 28px 16px; border: 1.5px dashed var(--taupe-200); border-radius: 14px; background: var(--taupe-50); }
 .chat-day { align-self: center; font-size: 11px; font-weight: 600; color: var(--muted); padding: 4px 10px; border-radius: 999px; background: var(--taupe-50); margin: 4px 0; }
 .msg { display: flex; align-items: flex-end; gap: 6px; max-width: 86%; }
@@ -107,7 +149,7 @@ body.locked #bell { display: none; }
 .msg-meta button { font-size: 11px; color: inherit; text-decoration: underline; opacity: .8; }
 .tag { color: var(--taupe-700); font-weight: 700; }
 .msg.mine .tag { color: var(--taupe); }
-.chat-compose { position: sticky; bottom: calc(-22px - var(--safe-b)); background: var(--white); padding: 8px 0 calc(4px + var(--safe-b)); border-top: 1px solid var(--line); margin-top: 6px; }
+.chat-compose { margin-top: 8px; }
 .tag-row { display: flex; gap: 6px; margin-bottom: 8px; overflow-x: auto; }
 .tag-row button { height: 30px; padding: 0 11px; border-radius: 999px; border: 1px solid var(--line); background: var(--taupe-50); font-size: 12.5px; font-weight: 600; color: var(--taupe-700); flex-shrink: 0; }
 .compose-row { display: flex; gap: 8px; align-items: flex-end; }
@@ -320,17 +362,17 @@ body.locked #bell { display: none; }
 
 /* ---------- Stepper in sheet ---------- */
 .stepper { display: grid; gap: 6px; margin: 8px 0 4px; }
-.stepper button {
+.stepper > button {
   display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px;
   border: 1px solid var(--line); background: var(--white); text-align: left; transition: all .2s;
 }
 .stepper .num { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; font: 700 12px var(--display); background: var(--taupe-100); color: var(--taupe-700); flex-shrink: 0; }
 .stepper .nm { flex: 1; font-weight: 600; font-size: 14px; }
 .stepper .ow { font-size: 12px; color: var(--muted); }
-.stepper button.done .num { background: var(--taupe); color: var(--ink); }
-.stepper button.cur { background: var(--ink); color: var(--white); border-color: var(--ink); }
-.stepper button.cur .num { background: var(--taupe); color: var(--ink); }
-.stepper button.cur .ow { color: var(--taupe); }
+.stepper > button.done .num { background: var(--taupe); color: var(--ink); }
+.stepper > button.cur { background: var(--ink); color: var(--white); border-color: var(--ink); }
+.stepper > button.cur .num { background: var(--taupe); color: var(--ink); }
+.stepper > button.cur .ow { color: var(--taupe); }
 
 /* ---------- Material card with 3D sheet stack ---------- */
 .mat { display: grid; grid-template-columns: 86px minmax(0, 1fr); gap: 14px; align-items: center; }
